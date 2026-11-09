@@ -34,6 +34,7 @@ from unblob.models import (
 )
 from unblob.report import (
     ExtractCommandFailedReport,
+    ExtractionProblem,
     ExtractorDependencyNotFoundReport,
 )
 
@@ -45,6 +46,11 @@ VOLUME_V5 = struct.Struct(
 )  # data offset, unknown, first/last index, first/last file
 FILE_INVALID = 0x8
 FD_FLAGS, FD_SIZES, FD_DATA_OFFSET = 8, 10, 0x26  # within a v5 file descriptor
+# From unshield 1.6.2 (libunshield.c, file.c): descriptor has a 0x3e-byte
+# fixed header followed by two arrays of 71 uint32 offsets. V5 file
+# descriptors have 0x3a bytes, including their MD5 field.
+MIN_DESCRIPTOR_SIZE = 0x3E + 2 * 71 * 4
+FILE_DESCRIPTOR_V5_SIZE = 0x3A
 
 
 def _unpack(fmt: str | struct.Struct, buf, offset: int) -> tuple:
@@ -69,16 +75,23 @@ def major_version(version: int) -> int:
     return max(major, 5)
 
 
-def _file_table_end(buf, start: int, descriptor: int) -> int:
-    """Furthest data offset + compressed size over the v5 file table."""
+def _file_table_end(buf, start: int, descriptor: int, descriptor_end: int) -> int:
+    """Furthest V5 file end; table and descriptors must fit their declared region."""
     (table_offset,) = _unpack("<I", buf, descriptor + 0x0C)
     (directories,) = _unpack("<I", buf, descriptor + 0x1C)
     (files,) = _unpack("<I", buf, descriptor + 0x28)
     table = descriptor + table_offset
+    # Check before building a Struct: corrupt count fields can be UINT32_MAX.
+    if table < descriptor or table > descriptor_end:
+        raise InvalidInputFormat("InstallShield file table outside descriptor")
+    if directories + files > (descriptor_end - table) // 4:
+        raise InvalidInputFormat("InstallShield file table exceeds descriptor")
     offsets = _unpack(f"<{directories + files}I", buf, table)
     end = 0
     for entry in offsets[directories:]:
         fd = table + entry
+        if fd < descriptor or fd + FILE_DESCRIPTOR_V5_SIZE > descriptor_end:
+            raise InvalidInputFormat("InstallShield file descriptor exceeds descriptor")
         (flags,) = _unpack("<H", buf, fd + FD_FLAGS)
         _expanded, compressed = _unpack("<II", buf, fd + FD_SIZES)
         (data_offset,) = _unpack("<I", buf, fd + FD_DATA_OFFSET)
@@ -95,15 +108,25 @@ def cabinet_end(buf, start: int) -> int:
         raise InvalidInputFormat("no ISc( signature")
     if major_version(version) != 5:
         raise InvalidInputFormat("only the version 5 cabinet layout is handled")
-    if desc_size == 0:
-        raise InvalidInputFormat("continuation volume without a descriptor")
-    end = start + desc_offset + desc_size
+    # A valid V5 descriptor must begin after the volume header and contain
+    # its fixed field tables; just checking for nonzero size accepts a
+    # fabricated 101-byte ISc( blob as a complete cabinet.
+    if desc_offset < COMMON.size + VOLUME_V5.size:
+        raise InvalidInputFormat("InstallShield descriptor overlaps volume header")
+    if desc_size < MIN_DESCRIPTOR_SIZE:
+        raise InvalidInputFormat("InstallShield descriptor too short")
+    descriptor = start + desc_offset
+    descriptor_end = descriptor + desc_size
+    if descriptor_end > len(buf):
+        raise InvalidInputFormat("InstallShield descriptor exceeds input")
+    end = max(
+        descriptor_end,
+        _file_table_end(buf, start, descriptor, descriptor_end),
+    )
     volume = _unpack(VOLUME_V5, buf, start + COMMON.size)
     last_offset, last_compressed = volume[7], volume[9]
     if last_offset:  # a spanned volume records where its data ends
         end = max(end, start + last_offset + last_compressed)
-    else:
-        end = max(end, _file_table_end(buf, start, start + desc_offset))
     if end > len(buf):
         raise InvalidInputFormat("file data lies beyond the data (a multi-volume set)")
     return end
@@ -205,6 +228,37 @@ class UnshieldSetExtractor(DirectoryExtractor):
         return ["unshield"]
 
     def extract(self, paths: list[Path], outdir: Path) -> ExtractResult | None:
+        # A gap can otherwise cause the directory handler to silently omit
+        # later cabinets while unshield succeeds on the earlier ones.
+        numbers = {_volume_number(path) for path in paths}
+        numbers.discard(None)
+        if not numbers or numbers != set(range(1, max(numbers) + 1)):
+            missing = sorted(set(range(1, max(numbers, default=1) + 1)) - numbers)
+            return ExtractResult(
+                reports=[
+                    ExtractionProblem(
+                        problem=(
+                            "Incomplete InstallShield cabinet set: missing "
+                            + ", ".join(f"data{n}.cab" for n in missing)
+                        ),
+                        resolution="Skipped extraction to avoid silently missing files.",
+                    )
+                ]
+            )
+        invalid = [
+            path.name
+            for path in paths
+            if _volume_number(path) is not None and not _is_cabinet(path)
+        ]
+        if invalid:
+            return ExtractResult(
+                reports=[
+                    ExtractionProblem(
+                        problem="Invalid InstallShield volume: " + ", ".join(invalid),
+                        resolution="Skipped extraction to avoid silently missing files.",
+                    )
+                ]
+            )
         # unshield finds the volumes by their lower-case names beside data1.
         with tempfile.TemporaryDirectory() as tmp:
             for path in paths:
@@ -236,13 +290,17 @@ class InstallShieldSetHandler(DirectoryHandler):
             return None  # the set starts at data1.hdr
         if not _is_cabinet(file):
             return None
-        volumes = []
-        for n in range(1, len(siblings) + 1):
-            volume = siblings.get(f"data{n}.cab")
-            if volume is None or not _is_cabinet(volume):
-                break
-            volumes.append(volume)
+        # Collect *all* numbered volumes, including those after a numbering
+        # gap, so the extractor can report incomplete sets instead of
+        # silently claiming a successful partial extraction.
+        volumes = [
+            (number, path)
+            for path in siblings.values()
+            if (number := _volume_number(path)) is not None and number >= 1
+        ]
+        volumes.sort()
         if header is None and len(volumes) < 2:
             return None
+        volumes = [path for _, path in volumes]
         paths = ([header] if header is not None else []) + volumes
         return MultiFile(name=file.stem, paths=paths)
